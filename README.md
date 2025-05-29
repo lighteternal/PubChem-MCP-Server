@@ -1,3 +1,4 @@
+![PubChem MCP Server Logo](pubchem-mcp-server-logo.png)
 # PubChem MCP Server
 
 A comprehensive Model Context Protocol (MCP) server for accessing the PubChem chemical database. This server provides access to over 110 million chemical compounds with extensive molecular properties, bioassay data, and chemical informatics tools.
