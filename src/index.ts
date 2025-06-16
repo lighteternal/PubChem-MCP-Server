@@ -1181,15 +1181,445 @@ class PubChemServer {
   }
 
   private async handleGetToxicityInfo(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Toxicity info not yet implemented', args }, null, 2) }] };
+    if (!isValidCidArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid CID arguments');
+    }
+
+    try {
+      const cid = args.cid;
+      const toxicityData: any = {
+        cid: cid,
+        toxicity_summary: {
+          acute_toxicity: {},
+          chronic_toxicity: {},
+          carcinogenicity: {},
+          mutagenicity: {},
+          reproductive_toxicity: {},
+          environmental_toxicity: {}
+        },
+        data_sources: [],
+        last_updated: new Date().toISOString()
+      };
+
+      // Try to get GHS classification data which includes toxicity information
+      try {
+        const ghsResponse = await this.apiClient.get(`/compound/cid/${cid}/classification/JSON`);
+        if (ghsResponse.data?.Informations) {
+          const ghsInfo = ghsResponse.data.Informations[0];
+          if (ghsInfo?.GHSClassification) {
+            toxicityData.ghs_classification = ghsInfo.GHSClassification;
+            toxicityData.data_sources.push('GHS Classification');
+          }
+        }
+      } catch (error) {
+        // GHS data not available, continue with other sources
+      }
+
+      // Try to get compound description which may contain toxicity information
+      try {
+        const descResponse = await this.apiClient.get(`/compound/cid/${cid}/description/JSON`);
+        if (descResponse.data?.InformationList?.Information) {
+          const descriptions = descResponse.data.InformationList.Information;
+          const toxicityDescriptions = descriptions.filter((desc: any) => 
+            desc.Title && (
+              desc.Title.toLowerCase().includes('toxicity') ||
+              desc.Title.toLowerCase().includes('toxic') ||
+              desc.Title.toLowerCase().includes('ld50') ||
+              desc.Title.toLowerCase().includes('carcinogen') ||
+              desc.Title.toLowerCase().includes('mutagen')
+            )
+          );
+          
+          if (toxicityDescriptions.length > 0) {
+            toxicityData.toxicity_descriptions = toxicityDescriptions.map((desc: any) => ({
+              title: desc.Title,
+              description: desc.Description,
+              source: desc.SourceName,
+              url: desc.ReferenceNumber ? `https://pubchem.ncbi.nlm.nih.gov/source/${desc.ReferenceNumber}` : null
+            }));
+            toxicityData.data_sources.push('PubChem Descriptions');
+          }
+        }
+      } catch (error) {
+        // Description data not available
+      }
+
+      // Get basic compound properties that relate to toxicity
+      try {
+        const propResponse = await this.apiClient.get(`/compound/cid/${cid}/property/MolecularWeight,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount/JSON`);
+        if (propResponse.data?.PropertyTable?.Properties?.[0]) {
+          const props = propResponse.data.PropertyTable.Properties[0];
+          toxicityData.molecular_properties = {
+            molecular_weight: props.MolecularWeight,
+            logp: props.XLogP,
+            polar_surface_area: props.TPSA,
+            hbd_count: props.HBondDonorCount,
+            hba_count: props.HBondAcceptorCount
+          };
+          
+          // Basic toxicity predictions based on molecular properties
+          toxicityData.predicted_toxicity = {
+            oral_toxicity_class: this.predictOralToxicity(props.MolecularWeight, props.XLogP),
+            bioaccumulation_potential: props.XLogP > 3 ? 'High' : props.XLogP > 1 ? 'Moderate' : 'Low',
+            membrane_permeability: props.TPSA < 140 ? 'High' : 'Low'
+          };
+        }
+      } catch (error) {
+        // Properties not available
+      }
+
+      // Add general toxicity assessment notes
+      toxicityData.assessment_notes = [
+        'This is a computational assessment based on available PubChem data',
+        'For definitive toxicity information, consult official regulatory databases',
+        'Experimental validation is required for safety assessments',
+        'Data availability varies significantly between compounds'
+      ];
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(toxicityData, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error fetching toxicity info: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 
   private async handleAssessEnvironmentalFate(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Environmental fate assessment not yet implemented', args }, null, 2) }] };
+    if (!isValidCidArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid CID arguments');
+    }
+
+    try {
+      const cid = args.cid;
+      const environmentalData: any = {
+        cid: cid,
+        environmental_fate: {
+          biodegradation: {},
+          bioaccumulation: {},
+          atmospheric_fate: {},
+          aquatic_fate: {},
+          soil_fate: {}
+        },
+        regulatory_status: {},
+        data_sources: [],
+        last_updated: new Date().toISOString()
+      };
+
+      // Get molecular properties for environmental fate prediction
+      try {
+        const propResponse = await this.apiClient.get(`/compound/cid/${cid}/property/MolecularWeight,XLogP,TPSA,CanonicalSMILES,MolecularFormula/JSON`);
+        if (propResponse.data?.PropertyTable?.Properties?.[0]) {
+          const props = propResponse.data.PropertyTable.Properties[0];
+          environmentalData.molecular_properties = {
+            molecular_weight: props.MolecularWeight,
+            logp: props.XLogP,
+            polar_surface_area: props.TPSA,
+            smiles: props.CanonicalSMILES,
+            formula: props.MolecularFormula
+          };
+
+          // Predict environmental fate based on molecular properties
+          environmentalData.environmental_fate = {
+            biodegradation: {
+              predicted_rate: this.predictBiodegradation(props.MolecularWeight, props.XLogP),
+              factors: [
+                'Molecular weight affects microbial uptake',
+                'LogP influences bioavailability',
+                'Structural complexity affects degradation pathways'
+              ]
+            },
+            bioaccumulation: {
+              potential: props.XLogP > 3 ? 'High' : props.XLogP > 1 ? 'Moderate' : 'Low',
+              bcf_estimate: props.XLogP ? Math.pow(10, 0.85 * props.XLogP - 0.70) : 'Not calculated',
+              factors: ['LogP is primary indicator of bioaccumulation potential']
+            },
+            atmospheric_fate: {
+              volatility: props.MolecularWeight < 200 ? 'High' : props.MolecularWeight < 500 ? 'Moderate' : 'Low',
+              photodegradation: 'Depends on molecular structure and UV absorption',
+              factors: ['Molecular weight affects vapor pressure']
+            },
+            aquatic_fate: {
+              solubility_prediction: props.XLogP < 0 ? 'High' : props.XLogP < 3 ? 'Moderate' : 'Low',
+              sorption_potential: props.XLogP > 2.5 ? 'High' : 'Low',
+              factors: ['LogP correlates with water solubility and sorption']
+            },
+            soil_fate: {
+              mobility: props.XLogP < 2 ? 'High' : props.XLogP < 4 ? 'Moderate' : 'Low',
+              persistence: 'Depends on soil conditions and microbial activity',
+              factors: ['Sorption to organic matter increases with LogP']
+            }
+          };
+
+          environmentalData.data_sources.push('Molecular Property Predictions');
+        }
+      } catch (error) {
+        // Properties not available
+      }
+
+      // Try to get environmental classification data
+      try {
+        const classResponse = await this.apiClient.get(`/compound/cid/${cid}/classification/JSON`);
+        if (classResponse.data?.Informations) {
+          const classInfo = classResponse.data.Informations[0];
+          if (classInfo?.GHSClassification) {
+            // Look for environmental hazard classifications
+            const envHazards = classInfo.GHSClassification.filter((item: any) => 
+              item.Category && (
+                item.Category.toLowerCase().includes('aquatic') ||
+                item.Category.toLowerCase().includes('environmental') ||
+                item.Category.toLowerCase().includes('ozone')
+              )
+            );
+            
+            if (envHazards.length > 0) {
+              environmentalData.environmental_hazards = envHazards;
+              environmentalData.data_sources.push('GHS Environmental Classification');
+            }
+          }
+        }
+      } catch (error) {
+        // Classification data not available
+      }
+
+      // Add assessment methodology and limitations
+      environmentalData.assessment_methodology = {
+        approach: 'QSAR-based predictions using molecular descriptors',
+        limitations: [
+          'Predictions are estimates based on molecular properties',
+          'Actual environmental fate depends on specific conditions',
+          'Experimental data should be used when available',
+          'Metabolites and transformation products not considered'
+        ],
+        recommended_tests: [
+          'OECD biodegradation studies',
+          'Bioaccumulation factor determination',
+          'Environmental monitoring data',
+          'Ecotoxicity testing'
+        ]
+      };
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(environmentalData, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error assessing environmental fate: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          },
+        ],
+        isError: true,
+      };
+    }
   }
 
   private async handleGetRegulatoryInfo(args: any) {
-    return { content: [{ type: 'text', text: JSON.stringify({ message: 'Regulatory info not yet implemented', args }, null, 2) }] };
+    if (!isValidCidArgs(args)) {
+      throw new McpError(ErrorCode.InvalidParams, 'Invalid CID arguments');
+    }
+
+    try {
+      const cid = args.cid;
+      const regulatoryData: any = {
+        cid: cid,
+        regulatory_status: {
+          fda: {},
+          epa: {},
+          echa: {},
+          international: {}
+        },
+        classifications: {},
+        data_sources: [],
+        last_updated: new Date().toISOString()
+      };
+
+      // Get basic compound information
+      try {
+        const compoundResponse = await this.apiClient.get(`/compound/cid/${cid}/JSON`);
+        if (compoundResponse.data?.PC_Compounds?.[0]) {
+          const compound = compoundResponse.data.PC_Compounds[0];
+          regulatoryData.compound_info = {
+            iupac_name: compound.props?.find((p: any) => p.urn?.label === 'IUPAC Name')?.value?.sval,
+            molecular_formula: compound.props?.find((p: any) => p.urn?.label === 'Molecular Formula')?.value?.sval,
+            cas_number: compound.props?.find((p: any) => p.urn?.label === 'CAS')?.value?.sval
+          };
+        }
+      } catch (error) {
+        // Compound info not available
+      }
+
+      // Get GHS classification which includes regulatory classifications
+      try {
+        const ghsResponse = await this.apiClient.get(`/compound/cid/${cid}/classification/JSON`);
+        if (ghsResponse.data?.Informations) {
+          const ghsInfo = ghsResponse.data.Informations[0];
+          if (ghsInfo?.GHSClassification) {
+            regulatoryData.classifications.ghs = {
+              hazard_classes: ghsInfo.GHSClassification.map((item: any) => ({
+                category: item.Category,
+                classification: item.Classification,
+                hazard_statement: item.HazardStatement,
+                signal_word: item.SignalWord
+              })),
+              source: ghsInfo.SourceName,
+              reference: ghsInfo.ReferenceNumber
+            };
+            regulatoryData.data_sources.push('GHS Classification System');
+          }
+        }
+      } catch (error) {
+        // GHS data not available
+      }
+
+      // Try to get compound descriptions that may contain regulatory information
+      try {
+        const descResponse = await this.apiClient.get(`/compound/cid/${cid}/description/JSON`);
+        if (descResponse.data?.InformationList?.Information) {
+          const descriptions = descResponse.data.InformationList.Information;
+          const regulatoryDescriptions = descriptions.filter((desc: any) => 
+            desc.Title && (
+              desc.Title.toLowerCase().includes('regulation') ||
+              desc.Title.toLowerCase().includes('regulatory') ||
+              desc.Title.toLowerCase().includes('fda') ||
+              desc.Title.toLowerCase().includes('epa') ||
+              desc.Title.toLowerCase().includes('approval') ||
+              desc.Title.toLowerCase().includes('controlled') ||
+              desc.Title.toLowerCase().includes('schedule')
+            )
+          );
+          
+          if (regulatoryDescriptions.length > 0) {
+            regulatoryData.regulatory_descriptions = regulatoryDescriptions.map((desc: any) => ({
+              title: desc.Title,
+              description: desc.Description,
+              source: desc.SourceName,
+              url: desc.ReferenceNumber ? `https://pubchem.ncbi.nlm.nih.gov/source/${desc.ReferenceNumber}` : null
+            }));
+            regulatoryData.data_sources.push('PubChem Regulatory Descriptions');
+          }
+        }
+      } catch (error) {
+        // Description data not available
+      }
+
+      // Add regulatory framework information
+      regulatoryData.regulatory_frameworks = {
+        united_states: {
+          fda: {
+            description: 'Food and Drug Administration',
+            scope: 'Food additives, drugs, cosmetics, medical devices',
+            database_url: 'https://www.fda.gov/'
+          },
+          epa: {
+            description: 'Environmental Protection Agency',
+            scope: 'Pesticides, industrial chemicals, environmental contaminants',
+            database_url: 'https://www.epa.gov/'
+          },
+          osha: {
+            description: 'Occupational Safety and Health Administration',
+            scope: 'Workplace chemical safety',
+            database_url: 'https://www.osha.gov/'
+          }
+        },
+        european_union: {
+          echa: {
+            description: 'European Chemicals Agency',
+            scope: 'REACH regulation, CLP classification',
+            database_url: 'https://echa.europa.eu/'
+          },
+          ema: {
+            description: 'European Medicines Agency',
+            scope: 'Pharmaceutical regulation',
+            database_url: 'https://www.ema.europa.eu/'
+          }
+        },
+        international: {
+          who: {
+            description: 'World Health Organization',
+            scope: 'Global health standards',
+            database_url: 'https://www.who.int/'
+          },
+          oecd: {
+            description: 'Organisation for Economic Co-operation and Development',
+            scope: 'Chemical testing guidelines',
+            database_url: 'https://www.oecd.org/'
+          }
+        }
+      };
+
+      // Add data limitations and recommendations
+      regulatoryData.data_limitations = [
+        'PubChem aggregates data from multiple sources with varying update frequencies',
+        'Regulatory status can change frequently - verify with official sources',
+        'Some regulatory information may not be publicly available',
+        'Regional regulations may differ significantly'
+      ];
+
+      regulatoryData.recommendations = [
+        'Consult official regulatory databases for current status',
+        'Check multiple jurisdictions for comprehensive coverage',
+        'Consider consulting regulatory affairs professionals',
+        'Monitor regulatory updates for changes in status'
+      ];
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(regulatoryData, null, 2),
+          },
+        ],
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Error fetching regulatory info: ${error instanceof Error ? error.message : 'Unknown error'}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
+
+  // Helper methods for toxicity and environmental predictions
+  private predictOralToxicity(molecularWeight?: number, logP?: number): string {
+    if (!molecularWeight || !logP) return 'Cannot predict - insufficient data';
+    
+    // Simple QSAR-based prediction
+    if (molecularWeight > 500 && logP > 5) return 'Class IV (Low toxicity)';
+    if (molecularWeight < 200 && logP < 0) return 'Class II (Moderate toxicity)';
+    if (logP > 3 && molecularWeight < 300) return 'Class III (Moderate-low toxicity)';
+    return 'Class III-IV (Moderate-low toxicity)';
+  }
+
+  private predictBiodegradation(molecularWeight?: number, logP?: number): string {
+    if (!molecularWeight || !logP) return 'Cannot predict - insufficient data';
+    
+    if (molecularWeight < 200 && logP < 3) return 'Fast (days to weeks)';
+    if (molecularWeight < 500 && logP < 4) return 'Moderate (weeks to months)';
+    if (molecularWeight > 500 || logP > 5) return 'Slow (months to years)';
+    return 'Moderate (weeks to months)';
   }
 
   private async handleGetExternalReferences(args: any) {
